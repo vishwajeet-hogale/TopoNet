@@ -1,5 +1,5 @@
 _base_ = []
-custom_imports = dict(imports=['projects.bevformer', 'projects.toponet'])
+custom_imports = dict(imports=['projects.bevformer', 'projects.toponet', 'projects.toponet.datasets.openlane_json_dataset'])
 
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
@@ -19,7 +19,9 @@ input_modality = dict(
 num_cams = 7
 pts_dim = 3
 
-dataset_type = 'OpenLaneV2_subset_A_Dataset'
+# dataset_type = 'OpenLaneV2_subset_A_Dataset'
+dataset_type = 'OpenLaneJSONDataset'
+# data_root = 'data'
 data_root = 'data/OpenLane-V2/'
 
 para_method = 'fix_pts_interp'
@@ -275,37 +277,68 @@ test_pipeline = [
     dict(type='CustomCollect3D', keys=['img'])
 ]
 
+# data = dict(
+#     samples_per_gpu=1,
+#     workers_per_gpu=8,
+#     train=dict(
+#         type=dataset_type,
+#         data_root=data_root,
+#         # ann_file=data_root + 'data_dict_subset_A_train.pkl',
+#         pipeline=train_pipeline,
+#         classes=class_names,
+#         modality=input_modality,
+#         split='train',
+#         filter_map_change=True,
+#         test_mode=False),
+#     val=dict(
+#         type=dataset_type,
+#         data_root=data_root,
+#         # ann_file=data_root + 'data_dict_subset_A_val.pkl',
+#         pipeline=test_pipeline,
+#         classes=class_names,
+#         modality=input_modality,
+#         split='val',
+#         test_mode=True),
+#     test=dict(
+#         type=dataset_type,
+#         data_root=data_root,
+#         # ann_file=data_root + 'data_dict_subset_A_val.pkl',
+#         pipeline=test_pipeline,
+#         classes=class_names,
+#         modality=input_modality,
+#         split='val',
+#         test_mode=True)
+# )
 data = dict(
     samples_per_gpu=1,
     workers_per_gpu=8,
+
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'data_dict_subset_A_train.pkl',
         pipeline=train_pipeline,
         classes=class_names,
-        modality=input_modality,
         split='train',
-        filter_map_change=True,
-        test_mode=False),
+        test_mode=False
+    ),
+
     val=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'data_dict_subset_A_val.pkl',
         pipeline=test_pipeline,
         classes=class_names,
-        modality=input_modality,
         split='val',
-        test_mode=True),
+        test_mode=True
+    ),
+
     test=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'data_dict_subset_A_val.pkl',
         pipeline=test_pipeline,
         classes=class_names,
-        modality=input_modality,
         split='val',
-        test_mode=True)
+        test_mode=True
+    )
 )
 
 optimizer = dict(
