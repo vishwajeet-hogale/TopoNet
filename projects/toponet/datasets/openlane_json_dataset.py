@@ -66,6 +66,34 @@ def load_openlane_json(root_dir, split):
     return data_infos
 
 
+def load_openlane_json_lazy(root_dir, split):
+    """Collect only file paths/identifiers without reading JSON contents.
+
+    Each entry is a lightweight stub with keys:
+        segment_id, timestamp, json_path, image_dir, _lazy (=True)
+    The actual JSON is loaded on first access via
+    ``OpenLaneJSONDataset._ensure_info_loaded``.
+    """
+    data_infos = []
+    split_dir = os.path.join(root_dir, split)
+    segments = sorted(glob.glob(os.path.join(split_dir, "*")))
+    for seg in segments:
+        seg_id = os.path.basename(seg)
+        info_dir = os.path.join(seg, "info")
+        image_dir = os.path.join(seg, "image")
+        json_files = sorted(glob.glob(info_dir + "/*.json"))
+        for jf in json_files:
+            timestamp = os.path.basename(jf).replace(".json", "")
+            data_infos.append({
+                "segment_id": seg_id,
+                "timestamp": timestamp,
+                "json_path": jf,
+                "image_dir": image_dir,
+                "_lazy": True,
+            })
+    return data_infos
+
+
 @DATASETS.register_module()
 class OpenLaneJSONDataset(Custom3DDataset):
 
@@ -77,11 +105,13 @@ class OpenLaneJSONDataset(Custom3DDataset):
                  pipeline=None,
                  test_mode=False,
                  modality=None,
+                 lazy_load=False,
                  **kwargs):
 
         self.split = split
         self.data_root = data_root
         self.test_mode = test_mode
+        self.lazy_load = lazy_load
         self.modality = modality if modality is not None else dict(
             use_lidar=False,
             use_camera=True,
@@ -90,8 +120,11 @@ class OpenLaneJSONDataset(Custom3DDataset):
             use_external=False
         )
 
-        # Load data infos
-        self.data_infos = load_openlane_json(data_root, split)
+        # Load data infos — lazy mode only collects paths, no JSON I/O
+        if lazy_load:
+            self.data_infos = load_openlane_json_lazy(data_root, split)
+        else:
+            self.data_infos = load_openlane_json(data_root, split)
         
         # Build pipeline from config
         if pipeline is not None:
@@ -109,8 +142,26 @@ class OpenLaneJSONDataset(Custom3DDataset):
         """Prepare results dict for pipeline."""
         results['img_metas'] = {}
     
+    @staticmethod
+    def _ensure_info_loaded(info):
+        """If *info* is a lazy stub, read its JSON and fill in full fields."""
+        if not info.get('_lazy', False):
+            return info
+        with open(info['json_path']) as f:
+            data = json.load(f)
+        info['sensor'] = data.get('sensor', {})
+        info['pose'] = data.get('pose', {})
+        if 'annotation' in data:
+            info['annotation'] = data['annotation']
+        if 'scenario_meta' in data:
+            info['scenario_meta'] = data['scenario_meta']
+        info['_lazy'] = False
+        return info
+
     def __getitem__(self, idx):
         """Get item from dataset."""
+        # Materialise lazy stubs on first access
+        self.data_infos[idx] = self._ensure_info_loaded(self.data_infos[idx])
         data = self.get_data_info(idx)
         if data is None:
             return None

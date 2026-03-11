@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import os
 import os.path as osp
 import warnings
@@ -41,6 +41,7 @@ SCENARIO_TITLES = {
     'topology_complexity': 'Topology Complexity',
 }
 PALETTE = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B3']
+METRIC_COLS_EVAL = ['OpenLane-V2 Score', 'DET_l', 'DET_t', 'TOP_ll', 'TOP_lt']
 
 
 def _bar_chart_per_scenario(df, scenario_type, global_score, run_dir):
@@ -238,6 +239,24 @@ def parse_args():
     )
 
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-samples", type=int, default=-1,
+                        help="Limit number of samples. Use -1 for full split.")
+    parser.add_argument("--workers-per-gpu", type=int, default=0,
+                        help="Dataloader workers per GPU (0 is safest on Windows).")
+    parser.add_argument("--stream-out", action="store_true",
+                        help="Stream per-sample predictions to disk to reduce RAM usage.")
+    parser.add_argument("--stream-dir", default="",
+                        help="Directory for streamed predictions. Default: <out-dir>/stream_outputs")
+    parser.add_argument("--clear-cache-interval", type=int, default=10,
+                        help="Call torch.cuda.empty_cache() every N batches. <=0 disables it.")
+    parser.add_argument("--sample-by-sample", action="store_true",
+                        help="Process and save each sample one-by-one, then aggregate metrics at the end.")
+    parser.add_argument("--no-per-sample-metrics", action="store_true",
+                        help="Disable per-sample metric computation in sample-by-sample mode.")
+    parser.add_argument("--segment-by-segment", action="store_true",
+                        help="Run inference one segment/folder at a time to avoid OOM on large splits.")
+    parser.add_argument("--split", type=str, default=None,
+                        help="Override data.test.split in config (e.g. train, val, test).")
 
     parser.add_argument(
         "--cfg-options",
@@ -249,13 +268,171 @@ def parse_args():
     return args
 
 
+def _sanitize_eval_kwargs(eval_kwargs):
+    """Remove EvalHook-only keys that dataset.evaluate does not accept."""
+    cleaned = dict(eval_kwargs) if eval_kwargs is not None else {}
+    for key in ['interval', 'tmpdir', 'start', 'gpu_collect', 'save_best', 'rule']:
+        cleaned.pop(key, None)
+    return cleaned
+
+
+def _sample_identifier(info, idx):
+    """Build a human-readable sample identifier from available metadata."""
+    if isinstance(info, dict):
+        if info.get('segment_id') is not None and info.get('timestamp') is not None:
+            return f"{info.get('segment_id')}_{info.get('timestamp')}"
+        if info.get('scene_token') is not None and info.get('timestamp') is not None:
+            return f"{info.get('scene_token')}_{info.get('timestamp')}"
+        if info.get('token') is not None:
+            return str(info.get('token'))
+    return f"sample_{idx:07d}"
+
+
+def _evaluate_single_sample(dataset, sample_info, pred, eval_kwargs):
+    """Evaluate one prediction against one sample by temporarily slicing data_infos."""
+    original_data_infos = dataset.data_infos
+    try:
+        dataset.data_infos = [sample_info]
+        return dataset.evaluate([pred], **eval_kwargs)
+    finally:
+        dataset.data_infos = original_data_infos
+
+
+def _save_per_sample_metrics(rows, out_dir):
+    """Write per-sample metric table and an aggregate summary table."""
+    if not rows:
+        return None, None
+
+    df = pd.DataFrame(rows)
+    per_sample_file = osp.join(out_dir, 'per_sample_metrics.csv')
+    df.to_csv(per_sample_file, index=False)
+
+    numeric_cols = [c for c in METRIC_COLS_EVAL if c in df.columns]
+    summary_rows = []
+    for metric in numeric_cols:
+        vals = pd.to_numeric(df[metric], errors='coerce').dropna()
+        if len(vals) == 0:
+            continue
+        summary_rows.append({
+            'metric': metric,
+            'count': int(vals.count()),
+            'mean': float(vals.mean()),
+            'std': float(vals.std(ddof=0)),
+            'min': float(vals.min()),
+            'max': float(vals.max()),
+        })
+
+    summary_file = None
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        summary_file = osp.join(out_dir, 'per_sample_metric_summary.csv')
+        summary_df.to_csv(summary_file, index=False)
+
+    return per_sample_file, summary_file
+
+
+def run_inference_memory_safe(model, data_loader, keep_outputs=True,
+                              stream_out=False, stream_dir=None,
+                              clear_cache_interval=10,
+                              compute_per_sample_metrics=False,
+                              eval_kwargs=None):
+    """Inference loop with optional streaming to disk to avoid RAM OOM."""
+    dataset = data_loader.dataset
+    prog_bar = mmcv.ProgressBar(len(dataset))
+    outputs = [] if keep_outputs else None
+    streamed_files = []
+    per_sample_metric_rows = []
+    stream_idx = 0
+
+    if stream_out and stream_dir:
+        mmcv.mkdir_or_exist(stream_dir)
+
+    model.eval()
+    with torch.no_grad():
+        for i, data in enumerate(data_loader):
+            result = model(return_loss=False, rescale=True, **data)
+            if not isinstance(result, list):
+                result = [result]
+
+            if keep_outputs:
+                outputs.extend(result)
+
+            if stream_out and stream_dir:
+                for item in result:
+                    out_path = osp.join(stream_dir, f"{stream_idx:07d}.pkl")
+                    mmcv.dump(item, out_path)
+                    streamed_files.append(out_path)
+
+                    if compute_per_sample_metrics and eval_kwargs is not None:
+                        sample_info = dataset.data_infos[stream_idx]
+                        sample_metrics = _evaluate_single_sample(
+                            dataset, sample_info, item, eval_kwargs
+                        )
+                        row = {
+                            'sample_index': stream_idx,
+                            'sample_id': _sample_identifier(sample_info, stream_idx),
+                        }
+                        row.update({k: sample_metrics.get(k) for k in METRIC_COLS_EVAL})
+                        per_sample_metric_rows.append(row)
+
+                    stream_idx += 1
+
+            for _ in range(len(result)):
+                prog_bar.update()
+
+            if torch.cuda.is_available() and clear_cache_interval > 0 and (i + 1) % clear_cache_interval == 0:
+                torch.cuda.empty_cache()
+
+    return outputs, streamed_files, per_sample_metric_rows
+
+def _get_sample_scenario_labels(info):
+    """Return {scenario_type: category_label} for a single sample's scenario_meta."""
+    out = {}
+    meta = info.get('scenario_meta', {})
+
+    if 'curvature' in meta:
+        v = meta['curvature'].get('value_m_inv')
+        t = meta['curvature'].get('thresholds_m_inv', {})
+        if v is not None:
+            if v <= t.get('straight', 0.003):
+                out['curvature'] = 'straight'
+            elif v <= t.get('low', 0.008):
+                out['curvature'] = 'low curvature'
+            elif v <= t.get('medium', 0.02):
+                out['curvature'] = 'medium curvature'
+            else:
+                out['curvature'] = 'high curvature'
+
+    if 'topology_complexity' in meta:
+        v = meta['topology_complexity'].get('value')
+        if v is not None:
+            if v <= 0.3:
+                out['topology_complexity'] = 'low topology complexity'
+            elif v <= 0.6:
+                out['topology_complexity'] = 'medium topology complexity'
+            else:
+                out['topology_complexity'] = 'high topology complexity'
+
+    if 'lighting' in meta:
+        lbl = meta['lighting'].get('label')
+        if lbl:
+            out['lighting'] = lbl
+
+    if 'occlusion' in meta:
+        lbl = meta['occlusion'].get('label')
+        if lbl:
+            out['occlusion'] = lbl
+
+    return out
+
+
 # ---------------------------------------------------
 # Scenario Evaluation
 # ---------------------------------------------------
 
 def evaluate_by_scenario(dataset, outputs, eval_kwargs, out_dir):
 
-    metric_cols = ['OpenLane-V2 Score', 'DET_l', 'DET_t', 'TOP_ll', 'TOP_lt']
+    metric_cols = METRIC_COLS_EVAL
     all_rows = []  # collect every row for the combined CSV
 
     # ---- Global ----
@@ -279,51 +456,8 @@ def evaluate_by_scenario(dataset, outputs, eval_kwargs, out_dir):
     }
 
     for i in range(len(dataset)):
-
-        info = dataset.data_infos[i]
-        if "scenario_meta" not in info:
-            continue
-
-        scenario_meta = info["scenario_meta"]
-        mapping = {}
-
-        if "curvature" in scenario_meta:
-            curve_value = scenario_meta["curvature"].get("value_m_inv", None)
-            thresholds = scenario_meta["curvature"].get("thresholds_m_inv", {})
-            if curve_value is not None:
-                if curve_value <= thresholds.get("straight", 0.003):
-                    mapping["curvature"] = "straight"
-                elif curve_value <= thresholds.get("low", 0.008):
-                    mapping["curvature"] = "low curvature"
-                elif curve_value <= thresholds.get("medium", 0.02):
-                    mapping["curvature"] = "medium curvature"
-                else:
-                    mapping["curvature"] = "high curvature"
-
-        if "topology_complexity" in scenario_meta:
-            topo_value = scenario_meta["topology_complexity"].get("value", None)
-            if topo_value is not None:
-                if topo_value <= 0.3:
-                    mapping["topology_complexity"] = "low topology complexity"
-                elif topo_value <= 0.6:
-                    mapping["topology_complexity"] = "medium topology complexity"
-                else:
-                    mapping["topology_complexity"] = "high topology complexity"
-
-        if "lighting" in scenario_meta:
-            lighting_label = scenario_meta["lighting"].get("label", None)
-            if lighting_label:
-                mapping["lighting"] = lighting_label
-
-        if "occlusion" in scenario_meta:
-            occlusion_label = scenario_meta["occlusion"].get("label", None)
-            if occlusion_label:
-                mapping["occlusion"] = occlusion_label
-
-        for key, value in mapping.items():
-            if value is None:
-                continue
-            scenarios[key].setdefault(value, []).append(i)
+        for stype, label in _get_sample_scenario_labels(dataset.data_infos[i]).items():
+            scenarios[stype].setdefault(label, []).append(i)
 
     # ---- Per-scenario evaluation ----
     print("\n==============================")
@@ -403,49 +537,124 @@ def evaluate_by_scenario(dataset, outputs, eval_kwargs, out_dir):
 # Main
 # ---------------------------------------------------
 
-def main():
+def _run_sample_by_sample(args, cfg):
+    """True sample-by-sample inference: lazy dataset, no dataloader.
 
-    args = parse_args()
+    1. Dataset init is instant (only globs file paths, no JSON I/O).
+    2. For each sample: load JSON → build tensor → infer → save .pkl → free mem.
+    3. After all samples: reload .pkl files from disk and aggregate metrics.
+    """
+    from mmcv.parallel import collate, scatter
 
-    cfg = Config.fromfile(args.config)
+    eval_kwargs = _sanitize_eval_kwargs(cfg.get("evaluation", {}).copy())
+    stream_dir = args.stream_dir if args.stream_dir else osp.join(args.out_dir, "stream_outputs")
+    mmcv.mkdir_or_exist(stream_dir)
 
-    if args.cfg_options:
-        cfg.merge_from_dict(args.cfg_options)
-
-    logger = get_logger(name="mmdet")
-
-    mmcv.mkdir_or_exist(osp.abspath(args.out_dir))
-
-    set_random_seed(args.seed)
-    # -------------------------
-    # Model
-    # -------------------------
+    # -- Model --
     model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
+    checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
+    model = MMDataParallel(model, device_ids=[0])
+    model.eval()
 
+    # -- Dataset (lazy – instant) --
+    print("Building dataset (lazy mode – no JSON reads) ...")
+    test_cfg = cfg.data.test.copy()
+    test_cfg['lazy_load'] = True
+    dataset = build_dataset(test_cfg)
+    total = len(dataset)
+    if args.max_samples > 0 and total > args.max_samples:
+        print(f"Limiting to first {args.max_samples} of {total} samples")
+        dataset.data_infos = dataset.data_infos[:args.max_samples]
+        total = args.max_samples
+
+    if "CLASSES" in checkpoint.get("meta", {}):
+        model.module.CLASSES = checkpoint["meta"]["CLASSES"]
+    else:
+        model.module.CLASSES = dataset.CLASSES
+
+    print(f"Starting sample-by-sample inference for {total} samples ...")
+    prog_bar = mmcv.ProgressBar(total)
+    streamed_files = []
+
+    with torch.no_grad():
+        for idx in range(total):
+            # 1) Load single sample (reads JSON only now)
+            data = dataset[idx]
+            if data is None:
+                prog_bar.update()
+                continue
+
+            # 2) Collate into a batch of 1 and move to GPU
+            data = collate([data], samples_per_gpu=1)
+            data = scatter(data, [0])[0]
+
+            # 3) Inference
+            result = model(return_loss=False, rescale=True, **data)
+            if not isinstance(result, list):
+                result = [result]
+
+            # 4) Save prediction to disk
+            for item in result:
+                out_path = osp.join(stream_dir, f"{idx:07d}.pkl")
+                mmcv.dump(item, out_path)
+                streamed_files.append(out_path)
+
+            # 5) Free memory for this sample
+            del data, result
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            prog_bar.update()
+
+    # -- Write manifest --
+    manifest_file = osp.join(stream_dir, "manifest.txt")
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        for fp in streamed_files:
+            f.write(fp + "\n")
+    print(f"\nStreamed {len(streamed_files)} predictions to: {stream_dir}")
+
+    # -- Aggregate metrics from saved files --
+    if args.eval:
+        print("Reloading predictions from disk for metric aggregation ...")
+        # Re-build dataset in full (eager) mode so evaluate() has annotations
+        dataset_full = build_dataset(cfg.data.test)
+        if args.max_samples > 0 and len(dataset_full) > args.max_samples:
+            dataset_full.data_infos = dataset_full.data_infos[:args.max_samples]
+
+        outputs = []
+        for fp in streamed_files:
+            outputs.append(mmcv.load(fp))
+
+        evaluate_by_scenario(dataset_full, outputs, eval_kwargs, args.out_dir)
+
+        del outputs  # free
+    print("Done.")
+
+
+def _run_dataloader_mode(args, cfg):
+    """Original dataloader-based inference (non-lazy)."""
+    eval_kwargs = _sanitize_eval_kwargs(cfg.get("evaluation", {}).copy())
+
+    # -- Model --
+    model = build_model(cfg.model, test_cfg=cfg.get("test_cfg"))
     checkpoint = load_checkpoint(model, args.checkpoint, map_location="cpu")
 
-    # -------------------------
-    # Dataset
-    # -------------------------
+    # -- Dataset --
     print("Building dataset")
     dataset = build_dataset(cfg.data.test)
-    
-    # Limit to first N samples for faster testing on limited GPU/memory
-    max_samples = 100
-    if len(dataset) > max_samples:
-        print(f"Limiting evaluation to first {max_samples} samples (original: {len(dataset)})")
-        dataset.data_infos = dataset.data_infos[:max_samples]
-    
+
+    if args.max_samples > 0 and len(dataset) > args.max_samples:
+        print(f"Limiting evaluation to first {args.max_samples} samples (original: {len(dataset)})")
+        dataset.data_infos = dataset.data_infos[:args.max_samples]
+
     print("Loading data")
     data_loader = build_dataloader(
         dataset,
         samples_per_gpu=1,
-        workers_per_gpu=0,  # Disable multiprocessing workers to avoid memory issues on Windows
+        workers_per_gpu=args.workers_per_gpu,
         dist=False,
         shuffle=False,
     )
-
-
 
     if "CLASSES" in checkpoint.get("meta", {}):
         model.CLASSES = checkpoint["meta"]["CLASSES"]
@@ -454,30 +663,55 @@ def main():
 
     model = MMDataParallel(model, device_ids=[0])
 
-    # -------------------------
-    # Inference
-    # -------------------------
+    # -- Inference --
+    keep_outputs = bool(args.eval) or bool(args.out)
+    effective_stream_out = bool(args.stream_out)
+    stream_dir = args.stream_dir if args.stream_dir else osp.join(args.out_dir, "stream_outputs")
 
-    outputs = single_gpu_test(model, data_loader)
+    outputs, streamed_files, _ = run_inference_memory_safe(
+        model,
+        data_loader,
+        keep_outputs=keep_outputs,
+        stream_out=effective_stream_out,
+        stream_dir=stream_dir,
+        clear_cache_interval=args.clear_cache_interval,
+    )
 
-    # -------------------------
-    # Save results
-    # -------------------------
-
-    if args.out:
+    # -- Save --
+    if args.out and outputs is not None:
         out_file = osp.join(args.out_dir, "results.pkl")
         mmcv.dump(outputs, out_file)
         print("Saved:", out_file)
 
-    # -------------------------
-    # Evaluation
-    # -------------------------
+    if effective_stream_out:
+        manifest_file = osp.join(stream_dir, "manifest.txt")
+        with open(manifest_file, "w", encoding="utf-8") as f:
+            for fp in streamed_files:
+                f.write(fp + "\n")
+        print(f"Streamed {len(streamed_files)} predictions to: {stream_dir}")
 
-    if args.eval:
-
-        eval_kwargs = cfg.get("evaluation", {}).copy()
-
+    # -- Evaluate --
+    if args.eval and outputs is not None:
         evaluate_by_scenario(dataset, outputs, eval_kwargs, args.out_dir)
+
+
+def main():
+    args = parse_args()
+    cfg = Config.fromfile(args.config)
+    if args.cfg_options:
+        cfg.merge_from_dict(args.cfg_options)
+
+    mmcv.mkdir_or_exist(osp.abspath(args.out_dir))
+    set_random_seed(args.seed)
+
+    if args.split:
+        cfg.data.test.split = args.split
+        print(f"Overriding data.test.split = '{args.split}'")
+
+    if args.sample_by_sample:
+        _run_sample_by_sample(args, cfg)
+    else:
+        _run_dataloader_mode(args, cfg)
 
 
 if __name__ == "__main__":

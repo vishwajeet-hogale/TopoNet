@@ -167,6 +167,71 @@ mkdir -p work_dirs/toponet
 ```
 
 ### Evaluate
+
+#### Scenario-aware evaluation (`test_scenario.py`)
+
+Two inference modes are available. Both produce global metrics, per-scenario breakdowns (curvature, lighting, occlusion, topology complexity), and visualization plots.
+
+**Normal mode** — loads the full dataset upfront, runs inference via a DataLoader:
+
+```bash
+python tools/test_scenario.py \
+    projects/configs/toponet_r50_8x1_24e_olv2_subset_A.py \
+    ckpts/toponet_r50_8x1_24e_olv2_subset_A.pth \
+    --eval chamfer \
+    --out \
+    --out-dir work_dirs/results \
+    --workers-per-gpu 0
+```
+
+**Sample-by-sample mode** — memory-safe, no DataLoader. Dataset init is instant (only file paths are collected, no JSON I/O). Each sample is loaded, inferred, and saved to disk one at a time. Metrics are aggregated at the end from the saved `.pkl` files:
+
+```bash
+python tools/test_scenario.py \
+    projects/configs/toponet_r50_8x1_24e_olv2_subset_A.py \
+    ckpts/toponet_r50_8x1_24e_olv2_subset_A.pth \
+    --eval chamfer \
+    --out-dir work_dirs/results \
+    --sample-by-sample
+```
+
+#### Common flags
+
+| Flag | Description |
+|------|-------------|
+| `--split train` | Override the config's test split (e.g. run on `train`, `val`, or `test`) |
+| `--max-samples N` | Only process the first N samples |
+| `--sample-by-sample` | Enable lazy sample-by-sample inference (memory-safe) |
+| `--stream-out` | Stream per-sample predictions to disk (normal mode) |
+| `--stream-dir <path>` | Custom directory for `.pkl` prediction files |
+| `--clear-cache-interval N` | Clear CUDA cache every N batches (default: 10) |
+| `--workers-per-gpu N` | DataLoader workers (default: 0, safest on Windows) |
+| `--cfg-options key=val` | Override any config value |
+
+#### Output structure
+
+```
+work_dirs/results/
+├── stream_outputs/              # Per-sample .pkl predictions
+│   ├── 0000000.pkl
+│   ├── 0000001.pkl
+│   └── manifest.txt
+└── eval_YYYYMMDD_HHMMSS/       # Aggregated evaluation
+    ├── global_metrics.csv
+    ├── all_metrics.csv
+    ├── scenario_curvature.csv
+    ├── scenario_lighting.csv
+    ├── scenario_occlusion.csv
+    ├── scenario_topology_complexity.csv
+    ├── bar_*.png / .pdf
+    ├── score_delta.png / .pdf
+    ├── heatmap.png / .pdf
+    ├── sample_distribution.png / .pdf
+    └── radar_*.png / .pdf
+```
+
+#### Legacy distributed evaluation
+
 You can set `--show` to visualize the results.
 
 ```bash
