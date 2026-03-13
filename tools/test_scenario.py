@@ -257,6 +257,8 @@ def parse_args():
                         help="Run inference one segment/folder at a time to avoid OOM on large splits.")
     parser.add_argument("--split", type=str, default=None,
                         help="Override data.test.split in config (e.g. train, val, test).")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume inference: skip samples whose .pkl already exists in stream-dir.")
 
     parser.add_argument(
         "--cfg-options",
@@ -572,12 +574,33 @@ def _run_sample_by_sample(args, cfg):
     else:
         model.module.CLASSES = dataset.CLASSES
 
-    print(f"Starting sample-by-sample inference for {total} samples ...")
+    # -- Resume: detect already-processed samples --
+    existing_indices = set()
+    if getattr(args, 'resume', False):
+        for fname in os.listdir(stream_dir):
+            if fname.endswith('.pkl'):
+                try:
+                    existing_indices.add(int(fname.replace('.pkl', '')))
+                except ValueError:
+                    pass
+        if existing_indices:
+            print(f"Resume: found {len(existing_indices)} existing predictions, will skip them")
+
+    remaining = total - len(existing_indices)
+    print(f"Starting sample-by-sample inference for {total} samples ({remaining} remaining) ...")
     prog_bar = mmcv.ProgressBar(total)
     streamed_files = []
 
     with torch.no_grad():
         for idx in range(total):
+            out_path = osp.join(stream_dir, f"{idx:07d}.pkl")
+
+            # Skip already-processed samples when resuming
+            if idx in existing_indices:
+                streamed_files.append(out_path)
+                prog_bar.update()
+                continue
+
             # 1) Load single sample (reads JSON only now)
             data = dataset[idx]
             if data is None:
@@ -595,7 +618,6 @@ def _run_sample_by_sample(args, cfg):
 
             # 4) Save prediction to disk
             for item in result:
-                out_path = osp.join(stream_dir, f"{idx:07d}.pkl")
                 mmcv.dump(item, out_path)
                 streamed_files.append(out_path)
 
