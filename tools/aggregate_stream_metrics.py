@@ -1,10 +1,12 @@
 import argparse
 import concurrent.futures
 import ctypes
+import gc
 import glob
 import json
 import os
 import os.path as osp
+from collections import OrderedDict
 from datetime import datetime
 
 import matplotlib
@@ -100,6 +102,15 @@ def parse_args():
         help="Number of worker threads used to preload pickles. 0 picks a reasonable default.",
     )
     parser.add_argument(
+        "--lazy-cache-items",
+        type=int,
+        default=128,
+        help=(
+            "Number of predictions kept in an in-memory LRU cache when using --cache-mode lazy. "
+            "Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--eval",
         nargs="+",
         default=None,
@@ -192,20 +203,37 @@ class _ProgressBar:
 class _LazyPklList:
     """List-like object that loads .pkl files on demand instead of all at once."""
 
-    def __init__(self, paths):
+    def __init__(self, paths, cache_items=0):
         self._paths = list(paths)
+        self._cache_items = max(int(cache_items), 0)
+        self._cache = OrderedDict() if self._cache_items > 0 else None
+
+    def _load_index(self, idx):
+        if self._cache is None:
+            return mmcv.load(self._paths[idx])
+
+        if idx in self._cache:
+            value = self._cache.pop(idx)
+            self._cache[idx] = value
+            return value
+
+        value = mmcv.load(self._paths[idx])
+        self._cache[idx] = value
+        if len(self._cache) > self._cache_items:
+            self._cache.popitem(last=False)
+        return value
 
     def __len__(self):
         return len(self._paths)
 
     def __getitem__(self, idx):
         if isinstance(idx, slice):
-            return _LazyPklList(self._paths[idx])
-        return mmcv.load(self._paths[idx])
+            return _LazyPklList(self._paths[idx], cache_items=self._cache_items)
+        return self._load_index(idx)
 
     def __iter__(self):
-        for p in self._paths:
-            yield mmcv.load(p)
+        for idx in range(len(self._paths)):
+            yield self._load_index(idx)
 
 
 def _resolve_stream_output_path(stream_dir, manifest_path, raw_path):
@@ -328,58 +356,10 @@ def _configure_dataset_for_eval(dataset_cfg):
     return dataset_cfg
 
 
-def _load_eval_info_from_json(json_path):
+def _load_scenario_meta_from_json(json_path):
     with open(json_path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
-    return {
-        "annotation": data.get("annotation"),
-        "scenario_meta": data.get("scenario_meta"),
-    }
-
-
-def _materialize_eval_metadata(dataset, num_workers):
-    if not hasattr(dataset, "data_infos") or not dataset.data_infos:
-        return
-
-    lazy_indices = [
-        idx for idx, info in enumerate(dataset.data_infos) if info.get("_lazy", False)
-    ]
-    if not lazy_indices:
-        return
-
-    workers = _resolve_load_workers(num_workers, len(lazy_indices))
-    progress = _ProgressBar(len(lazy_indices), "Loading evaluation metadata")
-
-    def _update_info(index, payload):
-        info = dict(dataset.data_infos[index])
-        if payload["annotation"] is not None:
-            info["annotation"] = payload["annotation"]
-        if payload["scenario_meta"] is not None:
-            info["scenario_meta"] = payload["scenario_meta"]
-        info["_lazy"] = False
-        dataset.data_infos[index] = info
-
-    try:
-        if workers == 1:
-            for index in lazy_indices:
-                payload = _load_eval_info_from_json(dataset.data_infos[index]["json_path"])
-                _update_info(index, payload)
-                progress.update()
-            return
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_index = {
-                executor.submit(
-                    _load_eval_info_from_json, dataset.data_infos[index]["json_path"]
-                ): index
-                for index in lazy_indices
-            }
-            for future in concurrent.futures.as_completed(future_to_index):
-                index = future_to_index[future]
-                _update_info(index, future.result())
-                progress.update()
-    finally:
-        progress.close()
+    return data.get("scenario_meta", {})
 
 
 def _materialize_predictions(paths, num_workers):
@@ -419,6 +399,10 @@ def _build_scenarios(dataset):
     progress = _ProgressBar(len(dataset), "Scanning scenario labels")
     try:
         for i, info in enumerate(dataset.data_infos):
+            if "scenario_meta" not in info and "json_path" in info:
+                info = dict(info)
+                info["scenario_meta"] = _load_scenario_meta_from_json(info["json_path"])
+                dataset.data_infos[i] = info
             for stype, label in _get_sample_scenario_labels(info).items():
                 scenarios[stype].setdefault(label, []).append(i)
             progress.update()
@@ -433,12 +417,15 @@ def _evaluate_subset(dataset, outputs, indices, eval_kwargs):
     try:
         dataset.data_infos = [original_data_infos[i] for i in indices]
         subset_outputs = [outputs[i] for i in indices]
-        return dataset.evaluate(subset_outputs, **eval_kwargs)
+        metrics = dataset.evaluate(subset_outputs, **eval_kwargs)
+        del subset_outputs
+        gc.collect()
+        return metrics
     finally:
         dataset.data_infos = original_data_infos
 
 
-def _choose_output_container(paths, cache_mode, max_preload_gb, load_workers):
+def _choose_output_container(paths, cache_mode, max_preload_gb, load_workers, lazy_cache_items):
     total_bytes = sum(osp.getsize(path) for path in paths)
     auto_limit_bytes = _get_auto_preload_limit_bytes(max_preload_gb)
     print(
@@ -466,7 +453,9 @@ def _choose_output_container(paths, cache_mode, max_preload_gb, load_workers):
         f"the auto preload threshold of {_format_bytes(auto_limit_bytes)}. "
         "Use --cache-mode memory to force preloading if RAM allows it."
     )
-    return _LazyPklList(paths)
+    if lazy_cache_items > 0:
+        print(f"Enabled lazy LRU cache for up to {lazy_cache_items} predictions.")
+    return _LazyPklList(paths, cache_items=lazy_cache_items)
 
 
 def _plot_global_metrics(global_row, run_dir):
@@ -547,6 +536,7 @@ def evaluate_by_scenario(dataset, outputs, eval_kwargs, out_dir):
         global_metrics = dataset.evaluate(outputs, **eval_kwargs)
         eval_progress.update()
         print(global_metrics)
+        gc.collect()
 
         global_row = {
             "scenario_type": "global",
@@ -650,10 +640,7 @@ def main():
         dataset.data_infos = dataset.data_infos[:keep_n]
         paths = paths[:keep_n]
 
-    if not _dataset_has_annotations(dataset):
-        _materialize_eval_metadata(dataset, args.load_workers)
-
-    if not _dataset_has_annotations(dataset):
+    if (not _dataset_has_annotations(dataset)) and (not _is_openlane_json_dataset(dataset_cfg)):
         split_name = getattr(cfg.data.test, "split", "unknown")
         raise RuntimeError(
             "Selected dataset split does not include ground-truth annotations, so "
@@ -671,6 +658,7 @@ def main():
         cache_mode=args.cache_mode,
         max_preload_gb=args.max_preload_gb,
         load_workers=args.load_workers,
+        lazy_cache_items=args.lazy_cache_items,
     )
     evaluate_by_scenario(dataset, outputs, eval_kwargs, args.out_dir)
 

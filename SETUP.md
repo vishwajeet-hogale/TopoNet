@@ -99,9 +99,16 @@ python tools/aggregate_stream_metrics.py projects/configs/toponet_r50_8x1_24e_ol
 
 Run the full aggregation once the smoke test succeeds:
 
-```powershell
+````powershell
 python tools/aggregate_stream_metrics.py projects/configs/toponet_r50_8x1_24e_olv2_subset_A.py --stream-dir work_dirs/results/stream_outputs --out-dir work_dirs/results --split train --cache-mode lazy
-```
+
+If aggregation still strains RAM or stalls mid-progress, cap lazy cache size explicitly:
+
+```powershell
+python tools/aggregate_stream_metrics.py projects/configs/toponet_r50_8x1_24e_olv2_subset_A.py --stream-dir work_dirs/results/stream_outputs --out-dir work_dirs/results --split train --cache-mode lazy --lazy-cache-items 32
+````
+
+````
 
 ## Aggregator Behavior
 
@@ -119,6 +126,7 @@ Key flags:
 | -------------------- | ------------------------------------------------------------ |
 | `--split train`      | Evaluate using the train split metadata and annotations      |
 | `--cache-mode lazy`  | Read `.pkl` files on demand instead of preloading everything |
+| `--lazy-cache-items` | Keep a small LRU cache in lazy mode (set `0` to disable cache) |
 | `--max-samples N`    | Limit aggregation to the first `N` streamed predictions      |
 | `--load-workers N`   | Number of worker threads for metadata or preload work        |
 | `--max-preload-gb N` | Optional manual preload threshold for auto mode              |
@@ -129,7 +137,7 @@ After aggregation completes, a new directory is created:
 
 ```text
 work_dirs/results/eval_YYYYMMDD_HHMMSS/
-```
+````
 
 Expected files:
 

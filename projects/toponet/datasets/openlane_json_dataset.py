@@ -1,7 +1,9 @@
 import os
 import copy
 import glob
+import gc
 import json
+import concurrent.futures
 
 import mmcv
 import numpy as np
@@ -11,10 +13,10 @@ from mmdet.datasets import DATASETS, PIPELINES
 from mmdet.datasets.pipelines import Compose
 from mmcv.utils import build_from_cfg
 from mmdet3d.datasets import Custom3DDataset
-from openlanev2.evaluation import evaluate as openlanev2_evaluate
 from openlanev2.utils import format_metric
 
 from ..core.lane.util import fix_pts_interpolate
+from ..utils.openlanev2_eval_stream import evaluate_centerline_stream
 
 
 def load_openlane_json(root_dir, split):
@@ -94,6 +96,12 @@ def load_openlane_json_lazy(root_dir, split):
     return data_infos
 
 
+def _load_annotation_from_json(json_path):
+    with open(json_path, 'r', encoding='utf-8') as handle:
+        data = json.load(handle)
+    return data.get('annotation')
+
+
 @DATASETS.register_module()
 class OpenLaneJSONDataset(Custom3DDataset):
 
@@ -157,6 +165,35 @@ class OpenLaneJSONDataset(Custom3DDataset):
             info['scenario_meta'] = data['scenario_meta']
         info['_lazy'] = False
         return info
+
+    @staticmethod
+    def _prepare_eval_annotation(annotation):
+        prepared = copy.deepcopy(annotation)
+        for lane in prepared['lane_centerline']:
+            lane['points'] = np.array(lane['points'], dtype=np.float32)
+            if len(lane['points']) == 201:
+                lane['points'] = lane['points'][::20]
+        for te in prepared['traffic_element']:
+            te['points'] = np.array(te['points'], dtype=np.float32)
+        prepared['topology_lclc'] = np.array(prepared['topology_lclc'], dtype=np.float32)
+        prepared['topology_lcte'] = np.array(prepared['topology_lcte'], dtype=np.float32)
+        return prepared
+
+    def _ensure_eval_annotation_loaded(self, index):
+        info = self.data_infos[index]
+        cached = info.get('_eval_annotation')
+        if cached is not None:
+            return cached
+
+        annotation = info.get('annotation')
+        if annotation is None:
+            annotation = _load_annotation_from_json(info['json_path'])
+
+        prepared = self._prepare_eval_annotation(annotation)
+        info = dict(info)
+        info['_eval_annotation'] = prepared
+        self.data_infos[index] = info
+        return prepared
 
     def __getitem__(self, idx):
         """Get item from dataset."""
@@ -273,19 +310,50 @@ class OpenLaneJSONDataset(Custom3DDataset):
         return input_dict
 
     def format_openlanev2_gt(self):
+        total = len(self.data_infos)
+        print(f'Preparing GT annotations for {total} samples ...')
+
+        pending_indices = [
+            idx for idx, info in enumerate(self.data_infos)
+            if info.get('_eval_annotation') is None
+        ]
+
+        if pending_indices:
+            workers = min(max(4, (os.cpu_count() or 4)), 16, len(pending_indices))
+            print(f'Loading and converting {len(pending_indices)} annotations with {workers} workers ...')
+            load_progress = mmcv.ProgressBar(len(pending_indices))
+
+            def _build_annotation(index):
+                info = self.data_infos[index]
+                annotation = info.get('annotation')
+                if annotation is None:
+                    annotation = _load_annotation_from_json(info['json_path'])
+                return index, self._prepare_eval_annotation(annotation)
+
+            if workers <= 1:
+                for idx in pending_indices:
+                    out_idx, prepared = _build_annotation(idx)
+                    info = dict(self.data_infos[out_idx])
+                    info['_eval_annotation'] = prepared
+                    self.data_infos[out_idx] = info
+                    load_progress.update()
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_to_idx = {executor.submit(_build_annotation, idx): idx for idx in pending_indices}
+                    for future in concurrent.futures.as_completed(future_to_idx):
+                        out_idx, prepared = future.result()
+                        info = dict(self.data_infos[out_idx])
+                        info['_eval_annotation'] = prepared
+                        self.data_infos[out_idx] = info
+                        load_progress.update()
+
         gt_dict = {}
-        for idx in range(len(self.data_infos)):
-            info = copy.deepcopy(self.data_infos[idx])
+        progress = mmcv.ProgressBar(total)
+        for idx in range(total):
+            info = self.data_infos[idx]
             key = (self.split, info['segment_id'], str(info['timestamp']))
-            for lane in info['annotation']['lane_centerline']:
-                lane['points'] = np.array(lane['points'], dtype=np.float32)
-                if len(lane['points']) == 201:
-                    lane['points'] = lane['points'][::20]  # downsample: 201 --> 11
-            for te in info['annotation']['traffic_element']:
-                te['points'] = np.array(te['points'], dtype=np.float32)
-            info['annotation']['topology_lclc'] = np.array(info['annotation']['topology_lclc'], dtype=np.float32)
-            info['annotation']['topology_lcte'] = np.array(info['annotation']['topology_lcte'], dtype=np.float32)
-            gt_dict[key] = info
+            gt_dict[key] = {'annotation': self._ensure_eval_annotation_loaded(idx)}
+            progress.update()
         return gt_dict
 
     def format_results(self, results):
@@ -368,8 +436,10 @@ class OpenLaneJSONDataset(Custom3DDataset):
         logger.info('Formatting predictions...')
         pred_dict = self.format_results(results)
 
-        logger.info('Running openlanev2 evaluate...')
-        metric_results = openlanev2_evaluate(gt_dict, pred_dict)
+        logger.info('Running streamed openlanev2 evaluate...')
+        metric_results = evaluate_centerline_stream(gt_dict, pred_dict)
+        del gt_dict, pred_dict
+        gc.collect()
         format_metric(metric_results)
         metric_results = {
             'OpenLane-V2 Score': metric_results['OpenLane-V2 Score']['score'],
