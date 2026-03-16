@@ -1,0 +1,3 @@
+category,samples,avg_lanes,avg_traffic_elements,avg_lane_conf_mean,avg_te_conf_mean
+poorly lit,362,200.0,100.0,0.13852029701550775,0.041945491791368354
+well lit,22115,200.0,100.0,0.14678855997278845,0.05128786863627347

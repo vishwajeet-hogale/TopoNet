@@ -1,0 +1,11 @@
+{
+  "rule": "occlusion_unknown treated as low occlusion",
+  "metrics": [
+    "OpenLane-V2 Score",
+    "DET_l",
+    "DET_t",
+    "TOP_ll",
+    "TOP_lt"
+  ],
+  "rows": 8
+}

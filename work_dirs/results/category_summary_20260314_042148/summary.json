@@ -1,0 +1,71 @@
+{
+  "curvature": {
+    "high curvature": {
+      "samples": 207,
+      "avg_lanes": 200.0,
+      "avg_traffic_elements": 100.0,
+      "avg_lane_conf_mean": 0.15108779394900165,
+      "avg_te_conf_mean": 0.04491746085493461
+    },
+    "straight": {
+      "samples": 21741,
+      "avg_lanes": 200.0,
+      "avg_traffic_elements": 100.0,
+      "avg_lane_conf_mean": 0.14619717201955923,
+      "avg_te_conf_mean": 0.05108884974108189
+    },
+    "medium curvature": {
+      "samples": 243,
+      "avg_lanes": 200.0,
+      "avg_traffic_elements": 100.0,
+      "avg_lane_conf_mean": 0.17170964565833288,
+      "avg_te_conf_mean": 0.06041364672635931
+    },
+    "low curvature": {
+      "samples": 286,
+      "avg_lanes": 200.0,
+      "avg_traffic_elements": 100.0,
+      "avg_lane_conf_mean": 0.1569930671264867,
+      "avg_te_conf_mean": 0.05144884666896887
+    }
+  },
+  "lighting": {
+    "well lit": {
+      "samples": 22115,
+      "avg_lanes": 200.0,
+      "avg_traffic_elements": 100.0,
+      "avg_lane_conf_mean": 0.14678855997278845,
+      "avg_te_conf_mean": 0.05128786863627347
+    },
+    "poorly lit": {
+      "samples": 362,
+      "avg_lanes": 200.0,
+      "avg_traffic_elements": 100.0,
+      "avg_lane_conf_mean": 0.13852029701550775,
+      "avg_te_conf_mean": 0.041945491791368354
+    }
+  },
+  "occlusion": {
+    "low occlusion": {
+      "samples": 12836,
+      "avg_lanes": 200.0,
+      "avg_traffic_elements": 100.0,
+      "avg_lane_conf_mean": 0.14216609188789678,
+      "avg_te_conf_mean": 0.04623862554756858
+    },
+    "high occlusion": {
+      "samples": 9633,
+      "avg_lanes": 200.0,
+      "avg_traffic_elements": 100.0,
+      "avg_lane_conf_mean": 0.15271802205462068,
+      "avg_te_conf_mean": 0.05769399997368215
+    },
+    "occlusion_unknown": {
+      "samples": 8,
+      "avg_lanes": 200.0,
+      "avg_traffic_elements": 100.0,
+      "avg_lane_conf_mean": 0.049586174078285694,
+      "avg_te_conf_mean": 0.01627295557409525
+    }
+  }
+}
